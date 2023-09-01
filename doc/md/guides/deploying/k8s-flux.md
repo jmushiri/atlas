@@ -1,289 +1,460 @@
 ---
-id: cloud-sql-via-github-actions
-slug: /guides/deploying/cloud-sql-via-github-actions
-title: Deploying schema migrations to Google CloudSQL using Atlas
+id: k8s-flux
+title: Deploying to Kubernetes with the Atlas Operator and Flux CD
+slug: /guides/deploying/k8s-flux
 ---
 
-## In this article
-* [Overview](#overview)
-* [What is Cloud SQL?](#what-is-cloud-sql)
-* [What is Cloud SQL Auth Proxy?](#what-is-cloud-sql-auth-proxy)
-* [What is GitHub Actions?](#what-is-github-actions])
-* [Deploying Schema Migrations to Cloud SQL](#deploying-schema-migrations-to-cloud-sql)
-* [Prerequisites](#prerequisites)
-* [Step-by-Step](#step-by-step)
-   1. [Authenticate to Google Cloud](#step-by-step)
-   2. [Retrieve your instance connection name](#retrieve-your-instance-connection-name)
-   3. [Store your password in GitHub Secrets](#store-your-password-in-github-secrets)
-   4. [Setup GitHub Actions](#setup-github-actions)
-   5. [Execute your GitHub Actions Workflow](#execute-your-github-actions-workflow)
-* [Wrapping Up](#wrapping-up)
+[GitOps](https://www.gitops.tech/) is a software development and deployment methodology that uses Git as the central repository
+for both code and infrastructure configurations, enabling automated and auditable deployments.
 
-## Overview
+[FluxCD](https://fluxcd.io/) is a Continuous Delivery tool that implements GitOps principles. It uses a declarative approach to keep Kubernetes clusters in sync with sources of configuration (like Git repositories), and automating updates to configuration when there is new code to deploy.
 
-In this guide, we demonstrate how to handle database schema changes when working with Cloud SQL. Within the framework of this topic, we are going to introduce how to set up a GitHub Actions workflow to automatically deploy database schema changes to a Cloud SQL instance. This approach is meant to enhance automation, version control, CI/CD, DevOps practices, and scalability, contributing to more efficient and reliable database management.
+[Kubernetes Operators](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/) are software extensions to Kubernetes that enable the automation and management of complex, application-specific operational tasks and domain-specific knowledge within a Kubernetes cluster.
 
-Before diving into the practical implementation, let's first look at some of the underlying technologies that we will be working with.
+In this guide, we will demonstrate how to use the [Atlas Kubernetes Operator](/integrations/kubernetes/operator) and Flux CD to achieve a GitOps-based deployment workflow for your database schema.
 
-## What is Cloud SQL?
-Cloud SQL is a fully-managed database service that makes it easy to set up, maintain, manage, and administer your relational databases in the cloud. With Cloud SQL, you can deploy your databases in a highly available and scalable manner, with automatic failover and load balancing, so that your applications can handle a large number of concurrent requests and traffic spikes. You can also choose from different machine types and storage sizes to meet your specific performance and storage requirements.
+## Pre-requisites
 
-## What is Cloud SQL Auth Proxy?
-The Cloud SQL Auth Proxy is a utility for ensuring simple, secure connections to your Cloud SQL instances. It provides a convenient way to control access to your database using Identity and Access Management (IAM) permissions while ensuring a secure connection to your Cloud SQL instance. Like most proxy tools, it serves as the intermediary authority on connection authorizations. Using the Cloud SQL Auth proxy is the recommended method for connecting to a Cloud SQL instance.
+* A running Kubernetes cluster  - For learning purposes, you can use 
+ [Minikube](https://minikube.sigs.k8s.io/docs/start/), which is a tool that runs a single-node
+ Kubernetes cluster inside a VM on your laptop.
+* [kubectl](https://kubernetes.io/docs/tasks/tools/) - a command-line tool for interacting with Kubernetes clusters.
+* [Helm](https://helm.sh/docs/intro/install/) - a package manager for Kubernetes.
 
-## What is GitHub Actions?
-GitHub Actions is a continuous integration and continuous delivery (CI/CD) platform that allows you to automate your build, test, and deployment pipeline. You can create workflows that build and test every pull request to your repository, or deploy merged pull requests to production. GitHub Actions goes beyond just DevOps and lets you run workflows when other events happen in your repository. For example, in this guide, you will run a workflow to automatically deploy migrations to a Cloud SQL database whenever someone pushes changes to the main branch in your repository.
+## High-level architecture
 
-## Deploying Schema Migrations to Cloud SQL
+Before we dive into the details of the deployment flow, let’s take a look at the high-level architecture of our application.
 
-### Prerequisites
+![Application Architecture](https://atlasgo.io/uploads/k8s/argocd/app-diagram.png)
 
-Prerequisites to the guide:
+On a high level, our application consists of the following components:
 
-1. You will need to have the GCP **Project Editor** role. This role grants you full read and write access to resources within your project.
-2. Google Cloud SDK installed on your workstation. If you have not installed the SDK, you can find [instructions for installing the SDK from the official documentation](https://cloud.google.com/sdk/docs/install/).
-3. A running Cloud SQL instance to work against. If you have not created the instance yet, see [Creating instances at cloud.google.com](https://cloud.google.com/sql/docs/postgres/create-instance).
-4. A GitHub repository to create and run a GitHub Actions workflow.
+1. A backend application - in our example we will use a plain NGINX server
+   as a placeholder for a real backend application.
+2.  A database - in our example we will use a MySQL pod for the database. In a more realistic scenario, you might want to use a managed database service like AWS RDS or GCP Cloud SQL.
+3. An `AtlasSchema`  Custom Resource that defines the database schema and is managed by the Atlas Operator.
 
-### Step-by-Step
-#### 1—Authenticate to Google Cloud
-There are two approaches to authenticating with Google Cloud: Authentication via a Google Cloud Service Account Key JSON or authentication via [Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation).
+In our application architecture, we have a database that is connected to our application and managed using Atlas CR (Custom Resource). The database plays a crucial role in storing and retrieving data for the application, while the Atlas CR provides seamless integration and management of the database schema within our Kubernetes environment.
 
-**Setup Workload Identity Federation** 
-Identity federation allows you to grant applications running outside Google Cloud access to Google Cloud resources, without using Service Account Keys. It is recommended over Service Account Keys as it eliminates the maintenance and security burden associated with service account keys and also establishes a trust delegation relationship between a particular GitHub Actions workflow invocation and permissions on Google Cloud.
+## How should you run schema changes in a Flux CD deployment? 
 
-For authenticating via Workload Identity Federation, you must create and configure a Google Cloud Workload Identity Provider. A Workload Identity Provider is an entity that describes a relationship between Google Cloud and an external identity provider, such as GitHub, AWS, Azure Active Directory, etc.
+Integrating GitOps practices with a database in our application stack poses a unique challenge. 
 
-To create and configure a Workload Identity Provider:
+Flux CD provides a declarative approach to GitOps, allowing us to define a Flux CD application and seamlessly handle the synchronization process. By pushing changes to the database schema or application code to the Git repository, Flux CD automatically syncs those changes to the Kubernetes cluster.
 
-1. Save your project ID as an environment variable. The rest of these steps assume this environment variable is set:
+However, as we discussed in the introduction, ensuring the proper order of deployments is critical. In our scenario, the database deployment must succeed before rolling out the application to ensure its functionality. If the database deployment encounters an issue, it is essential to address it before proceeding with the application deployment. 
 
-```bash
-$ export PROJECT_ID="my-project" # update with your value
-```
-2. Create a Google Cloud Service Account. If you already have a Service Account, take note of the email address and skip this step.
+Flux CD provides a mechanism to orchestrate multiple deployments in a specific ordered sequence to ensure certain resources are healthy before subsequent resources are synced/reconciled.
 
-```bash
-$ gcloud iam service-accounts create "my-service-account" \
-  --project "${PROJECT_ID}"
-```
+By using `.spec.dependsOn`, you can define the apply order and thus determine the sequence of manifest applications. `.spec.dependsOn` is used to refer to other Kustomization objects that the Kustomization depends on. If specified, then the Kustomization is only applied after the referred Kustomizations are ready, i.e. have the `Ready` condition marked as `True`. The readiness state of a Kustomization is determined by its last applied status condition.
 
-3. Enable the IAM Credentials API:
+For example, assuming we have a scenario where the apps have the dependency:
 
-```bash
-$ gcloud services enable iamcredentials.googleapis.com
-```
+`MySQL service → Nginx Service`
 
-4. Grant the Google Cloud Service Account permissions to edit Cloud SQL resources.
-
-```bash
-$ gcloud projects add-iam-policy-binding [PROJECT_NAME] \
---member serviceAccount:[SERVICE_ACCOUNT_EMAIL] \
---role roles/editor
-```
-
-Replace **[PROJECT_NAME]** with the name of your project, and **[SERVICE_ACCOUNT_EMAIL]** with the email address of the service account you want to grant access to.
-
-5. Create a new workload identity pool:
-
-```bash
-$ gcloud iam workload-identity-pools create "my-pool" \
-  --project="${PROJECT_ID}" \
-  --location="global" \
-  --display-name="My pool"
-```
-
-6. Get the full ID of the Workload Identity Pool:
-
-```bash
-$ gcloud iam workload-identity-pools describe "my-pool" \
-  --project="${PROJECT_ID}" \
-  --location="global" \
-  --format="value(name)"
-```
-
-Save this value as an environment variable:
-
-```bash
-$ export WORKLOAD_IDENTITY_POOL_ID="..." # value from above
-
-# This should look like:
-#
-#   projects/123456789/locations/global/workloadIdentityPools/my-pool
-#
-```
-
-7. Create a Workload Identity Provider in that pool:
-
-```bash
-$ gcloud iam workload-identity-pools providers create-oidc "my-provider" \
-  --project="${PROJECT_ID}" \
-  --location="global" \
-  --workload-identity-pool="my-pool" \
-  --display-name="GitHub provider" \
- --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository" \
-  --issuer-uri="https://token.actions.githubusercontent.com"
-```
-
-8. Allow authentications from the Workload Identity Provider originating from your repository to impersonate the Service Account created above:
-
-```bash
-# Update this value to your GitHub repository.
-
-$ export REPO="username/repo_name" # e.g. "ariga/atlas"
-
-$ gcloud iam service-accounts add-iam-policy-binding "my-service-account@${PROJECT_ID}.iam.gserviceaccount.com" \
-  --project="${PROJECT_ID}" \
-  --role="roles/iam.workloadIdentityUser" \
-  --member="principalSet://iam.googleapis.com/${WORKLOAD_IDENTITY_POOL_ID}/attribute.repository/${REPO}"
-```
-
-Note that **$WORKLOAD_IDENTITY_POOL_ID** should be the full Workload Identity Pool resource ID, like:
-
-**projects/123456789/locations/global/workloadIdentityPools/my-pool**
-
-9. Extract the Workload Identity Provider resource name:
-
-```bash
-$ gcloud iam workload-identity-pools providers describe "my-provider" \
-  --project="${PROJECT_ID}" \
-  --location="global" \
-  --workload-identity-pool="my-pool" \
-  --format="value(name)"
-```
-
-Use this value as the **workload_identity_provider** value in your GitHub Actions YAML.
-
-Using the Workload Identity Provider ID and Service Account email, the GitHub Action will mint a GitHub OIDC token and exchange the GitHub token for a Google Cloud access token.
-
-**Note:** It can take up to **5 minutes** from when you configure the Workload Identity Pool mapping until the permissions are available.
-
-#### 2—Retrieve your Instance Connection Name 
-The instance connection name is a connection string that identifies a Cloud SQL instance, and you need this string to establish a connection to your database.  The format of the connection name is **projectID:region:instanceID**.
-
-To retrieve the Cloud SQL instance connection name, run the following command:
-
-```bash
-$ gcloud sql instances describe <INSTANCE_NAME> --format='value(connectionName)'
-```
-
-For example, if your instance name is **"my-instance"**, you can retrieve its connection name using the following command:
-
-```bash
-$ gcloud sql instances describe my-instance --format='value(connectionName)' 
-```
-
-#### 3—Store your Password in GitHub Secrets
-Secrets are a way to store sensitive information securely in a repository, such as passwords, API keys, and access tokens. To use secrets in your workflow, you must first create the secret in your repository's settings by following these steps:
-
-1. Navigate to your repository on GitHub.
-2. Click on the **"Settings"** tab.
-3. Click on **"Secrets"** in the left sidebar.
-4. Click on **"New repository secret"**.
-5. Enter **"DB_PASSWORD"** in the **"Name"** field.
-6. Enter the actual password in the **"Value"** field.
-7. Click on **"Add secret"**.
-
-Once you have added the secret, you can reference it in your workflow using **`${{ secrets.DB_PASSWORD }}`**. The action will retrieve the actual password value from the secret and use it in the **`DB_PASSWORD`** environment variable during the workflow run.
-
-#### 4—Setup GitHub Actions
-Here is an example GitHub Actions workflow for authenticating to GCP with workload identity federation and deploying migrations to a Cloud SQL MySQL database using Cloud SQL Proxy:
+If the `Nginx` service starts without the `MySQL` pod being ready, it will not be able to read requested data in the `MySQL` database.
+You can instruct the controller to apply the `Nginx` Kustomization before backend by defining a `dependsOn` relationship between the two:
 
 ```yaml
-name: Deploy Migrations
-
-on:
-  push:
-    branches:
-      - main
-
-env:
-  PROJECT_ID: my-project-id
-  INSTANCE_CONNECTION_NAME: my-instance-connection-name
-  DB_HOST: 127.0.0.1
-  DB_PORT: 3306
-  DB_NAME: my-db-name
-  DB_USER: my-db-user
-  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-
-jobs:
-  deploy-migrations:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: 'read'
-      id-token: 'write'
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      - name: Download and install Atlas CLI
-        run: |
-          curl -sSf https://atlasgo.sh | sh -s -- -y
-
-      - name: Download wait-for-it.sh
-        run: |
-          wget https://raw.githubusercontent.com/vishnubob/wait-for-it/master/wait-for-it.sh
-          chmod +x wait-for-it.sh
-
-      - id: 'auth'
-        uses: 'google-github-actions/auth@v1'
-        with:
-          workload_identity_provider: 'projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider'
-          service_account: 'my-service-account@my-project.iam.gserviceaccount.com'
-
-      - name: 'Set up Cloud SDK'
-        uses: 'google-github-actions/setup-gcloud@v1'
-        with:
-          version: '>= 416.0.0'
-
-      - name: Download Cloud SQL Proxy
-        run: |
-          wget https://dl.google.com/cloudsql/cloud_sql_proxy.linux.amd64 -O cloud_sql_proxy
-          chmod +x cloud_sql_proxy
-
-      - name: Start Cloud SQL Proxy
-        run: ./cloud_sql_proxy -instances=$INSTANCE_CONNECTION_NAME=tcp:3306 &
-
-      - name: Wait for Cloud SQL Proxy to Start
-        run: |
-          ./wait-for-it.sh $DB_HOST:$DB_PORT -s -t 10 -- echo "Cloud SQL Proxy is running"
-
-      - name: Deploy Migrations
-        run: |
-          echo -ne '\n' | atlas migrate apply   --url "mysql://$DB_USER:$DB_PASSWORD@$DB_HOST:$DB_PORT/$DB_NAME"   --dir file://migrations
-
-      - name: Stop Cloud SQL Proxy
-        run: kill $(ps aux | grep cloud_sql_proxy | grep -v grep | awk '{print $2}')
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: mysql
+  namespace: flux-system
+spec:
+  interval: 5m
+  path: "./kustomize"
+  prune: true
+  sourceRef:
+  kind: GitRepository
+  name: flux-system
+  healthChecks:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: mysql
+    namespace: default
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: nginx
+  namespace: flux-system
+spec:
+  dependsOn:
+  - name: mysql
+  interval: 5m
+  path: "./kustomize"
+  prune: true
+  sourceRef:
+  kind: GitRepository
+  name: flux-system
 ```
 
-Note that for this workflow to work, you will need to replace the placeholders in the environment variables with your own values. Your migrations directory should be stored in your repository's root directory.
+`.spec.healthChecks` in this manifest is used to refer to resources for which the Flux controller will perform health checks. This is used to determine the rollout status of deployed workloads and the `Ready` status of custom resources.
 
-Here's what this workflow does:
+This is helpful when there is a need to make sure other resources exist before the workloads defined in a Kustomization are deployed. To ensure that database resources are created and applied before our application, we will utilize Flux CD `dependsOn` and `health checks` feature.
 
-1. Sets the name of the workflow to **"Deploy Migrations"**.
-2. Triggers on a push to the **main** branch.
-3. Sets the environment variables required for the Cloud SQL instance and the database we want to deploy migrations to.
-4. Defines a job named **"deploy-migrations"** that runs on the latest version of Ubuntu.
-5. Checkout the code.
-6. Downloads and installs the Atlas CLI.
-7. Uses the Google Cloud Workload Identity Federation to authenticate with Google Cloud. 
-8. Configures the [Google Cloud SDK](https://cloud.google.com/sdk/) in the GitHub Actions environment. 
-9. Downloads the Cloud SQL Proxy and makes it executable.
-10. Starts the Cloud SQL Proxy, to create a secure tunnel between your GitHub Actions runner and your Cloud SQL instance.
-11. Wait for Cloud SQL Proxy to start up before proceeding with the subsequent steps.
-12. Deploys all pending migration files in the migration directory on a Cloud SQL database.
-13. Stops the Cloud SQL Proxy
+The diagram shows our application dependency graph:
 
-#### 5—Execute your GitHub Actions Workflow 
-To execute this workflow once you commit to the main branch, follow these steps:
+![Application Architecture](https://atlasgo.io/uploads/k8s/argocd/deployment-flow.png)
 
-1. Create a new file named **atlas_migrate_db.yml** in the **.github/workflows/** directory of your repository.
-2. Add the code block we've just discussed to the **atlas_migrate_db.yml** file.
-3. Commit the **atlas_migrate_db.yml** file to your repository's **main** branch.
+With the theoretical background out of the way, let’s take a look at a practical example of how to deploy an application with Flux CD and the Atlas Operator.
 
-Now, whenever you push changes to the **main** branch, all pending migrations will be executed. You can monitor the progress of the GitHub Action in the "Actions" tab of your repository.
+## Installation
 
-## Wrapping Up
-In this guide, you learned how to deploy schema migrations to Cloud SQL using Atlas, while ensuring secure connections via a Cloud SQL Proxy. With this knowledge, you can leverage the power of Atlas and Cloud SQL to manage your database schema changes with ease and confidence.
+### 1. Install the Atlas Operator
 
-In addition to the specific steps outlined in this guide, you also gained valuable experience with various concepts and tools that are widely used in database management, such as GitHub Actions, Cloud SQL, Cloud SQL Proxy, and the Google Cloud SDK. We hope that this guide has been helpful in expanding your knowledge and skills.
+To install the `Atlas Operator` run the following command:
+
+```bash
+helm install atlas-operator oci://ghcr.io/ariga/charts/atlas-operator
+```
+
+`Helm` will print something like this:
+
+```bash
+Pulled: ghcr.io/ariga/charts/atlas-operator:0.3.0
+ Digest: sha256:4dfed310f0197827b330d2961794e7fc221aa1da1d1b95736dde65c090e6c714
+ NAME: atlas-operator
+ LAST DEPLOYED: Tue Jun 27 16:58:30 2023
+ NAMESPACE: default
+ STATUS: deployed
+ REVISION: 1
+ TEST SUITE: None
+```
+
+Wait until the `atlas-operator` pod is running:
+
+```bash
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=atlas-operator -n default
+```
+
+`kubectl` will print something like this:
+
+```bash
+pod/atlas-operator-866dfbc56d-qkkkn condition met
+```
+
+### 2. Install the Flux CLI
+
+The flux command-line interface (CLI) is used to bootstrap and interact with Flux.
+
+To install the CLI with [bash] (https://www.gnu.org/software/bash/) for macOS or Linux, run:
+
+```bash
+curl -s https://fluxcd.io/install.sh | sudo bash
+```
+
+To install the CLI with [Chocolatey] (https://chocolatey.org/) for Windows, run:
+
+```bash
+choco install flux
+```
+
+Check you have everything needed to run Flux by running the following command:
+
+```bash
+flux check --pre
+```
+
+The output is similar to:
+
+```bash
+► checking prerequisites
+✔ kubernetes 1.26.3 >=1.23.0
+✔ prerequisites checks passed
+```
+
+### 3. Create a GitHub Personal Access Token
+
+The GitHub personal access token will be used in place of a password when authenticating to GitHub in the command line or with the API.
+
+1. In the upper-right corner of any page, click your profile photo, then click `Settings`.
+2. In the left sidebar, click  `< > Developer settings`.
+3. In the left sidebar, under  `Personal access tokens`, click `Tokens (classic)``.
+4. Select `Generate new token`, then click `Generate new token (classic)``.
+5. In the `"Note"`` field, give your token a descriptive name.
+6. To give your token an expiration, select `Expiration`, then choose a default option or click `Custom` to enter a date.
+7. Select the scopes you'd like to grant this token. To use your token to access repositories from the command line, select `repo`. A token with no assigned scopes can only access public information.
+8. Click `Generate token`.
+9. Copy the new token to your clipboard.
+
+### 4. Export your GitHub Credentials
+
+Export your GitHub personal access token and username:
+
+```bash
+export GITHUB_TOKEN=<your-token>
+export GITHUB_USER=<your-username>
+```
+
+### 5. Install Flux onto your Kubernetes Cluster
+
+Run the bootstrap command:
+
+```bash
+flux bootstrap github \
+  --owner=$GITHUB_USER \
+  --repository=flux-infrastucture \
+  --branch=main \
+  --path=./clusters/dev \
+  --personal
+```
+
+You will be prompted to enter your GitHub personal access token. The output is similar to:
+
+```bash
+► connecting to github.com
+✔ repository created
+✔ repository cloned
+✚ generating manifests
+✔ components manifests pushed
+► installing components in flux-system namespace
+deployment "source-controller" successfully rolled out
+deployment "kustomize-controller" successfully rolled out
+deployment "helm-controller" successfully rolled out
+deployment "notification-controller" successfully rolled out
+✔ install completed
+► configuring deploy key
+✔ deploy key configured
+► generating sync manifests
+✔ sync manifests pushed
+► applying sync manifests
+◎ waiting for cluster sync
+✔ bootstrap finished
+```
+
+Using the flux bootstrap command you can install Flux on a Kubernetes cluster and configure it to manage itself from a Git repository. The bootstrap command above does the following:
+
+- Creates a git repository flux-infrastructure on your GitHub account.
+- Adds Flux component manifests to the repository.
+- Deploys Flux Components to your Kubernetes Cluster.
+- Configures Flux components to track the path /clusters/dev/ in the repository.
+
+## Deploy the Sample Application on your Cluster
+
+In this example, we’re using the `jmushiri/atlas-flux-demo` repository, which contains all of the Kubernetes manifests necessary to deploy our application.
+
+### 1. Fork the Sample Application
+
+To get started, you need to fork and then clone the sample application repository to your local machine. Open your web browser and go to the sample application repository on GitHub:
+https://github.com/jmushiri/atlas-flux-demo
+Click on the `"Fork"` button in the top-right corner of the GitHub page. This will create a copy of the repository under your GitHub account.
+ 
+### 2. Clone the Sample Application
+
+Once the forking process is complete, you will be redirected to your own forked repository. Open your terminal or command prompt and run the following command to clone the forked repository to your local machine:
+git clone https://github.com/$GITHUB_USER/atlas-flux-demo.git
+
+### 3. Deploy the Sample Application
+
+Navigate into the cloned repository by running the following command:
+
+```bash
+cd atlas-flux-demo
+```
+
+Deploy the application:
+
+```bash
+kubectl apply -k kustomize
+```
+
+The output is similar to:
+
+```bash
+service/mysql created
+deployment.apps/mysql created
+deployment.apps/nginx created
+```
+
+### 4. Clone the git Repository
+
+Clone the `flux-infrastructure` repository to your local machine:
+ 
+```bash
+git clone https://github.com/$GITHUB_USER/flux-infrastructure
+ 
+cd flux-infrastructure
+```
+
+### 5. Add the Repository (atlas-flux-demo repository) to Flux
+ 
+Create a GitRepository manifest pointing to `atlas-flux-demo` repository’s main branch:
+
+```bash
+flux create source git atlas-flux-demo --url=https://github.com/jmushiri/atlas-flux-demo --branch=main --interval=30s --export > ./clusters/dev/atlas-flux-demo-source.yaml
+```
+
+The output is similar to:
+
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: atlas-flux-demo
+  namespace: flux-system
+spec:
+  interval: 30s
+  ref:
+    branch: main
+  url: https://github.com/$GITHUB_USER/atlas-flux-demo
+```
+
+Commit and push the `atlas-flux-demo-source.yaml` file to the `flux-infrastructure` repository:
+
+```bash
+git add -A && git commit -m "Add atlas-flux-demo GitRepository"
+ 
+git push
+```
+
+## Implement a Continuous Deployment (CD) Flow
+
+It's time to configure Flux to build and apply the kustomize directory located in the `atlas-flux-demo` repository.
+ 
+Use the `flux create` command to create a `Kustomization` that applies the `atlas-flux-demo` deployment.
+
+```bash
+flux create kustomization atlas-flux-demo \
+  --target-namespace=default \
+  --source=atlas-flux-demo \
+  --path="./kustomize" \
+  --prune=true \
+  --interval=5m \
+  --export > ./clusters/dev/atlas-flux-demo-kustomization.yaml
+```
+
+The output is similar to:
+
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: atlas-flux-demo
+  namespace: flux-system
+spec:
+  interval: 5m0s
+  path: ./kustomize
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: atlas-flux-demo
+  targetNamespace: default
+```
+
+The structure of the `flux-infrasture` repo should be similar to:
+
+```bash
+flux-infrastructure
+└── clusters/
+    └── dev/
+        ├── flux-system/                        
+        │   ├── gotk-components.yaml
+        │   ├── gotk-sync.yaml
+        │   └── kustomization.yaml
+        ├── atlas-flux-demo-kustomization.yaml
+        └── atlas-flux-demo-source.yaml
+```
+
+## Implement the Deployment Flow
+
+To implement the deployment flow in a specific ordered sequence, we will use Flux CD’s `.spec.dependsOn` and `.spec.healthChecks` feature.
+
+Edit the `atlas-flux-demo-kustomization.yaml` file as follows:
+
+```yaml
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: mysql
+  namespace: flux-system
+spec:
+  interval: 30s
+  path: ./kustomize
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: atlas-flux-demo
+  targetNamespace: default
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: mysql
+      namespace: default
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: myapp
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: mysql
+  interval: 30s
+  path: ./kustomize
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: atlas-flux-demo
+  targetNamespace: default
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: nginx
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: myapp
+  interval: 30s
+  path: ./kustomize
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: atlas-flux-demo
+  targetNamespace: default
+  healthChecks:
+    - apiVersion: db.atlasgo.io/v1alpha1
+      kind: AtlasSchema
+      name: myapp
+      namespace: default
+```
+
+Commit and push the `Kustomization` manifest to the repository:
+
+```bash
+git add -A && git commit -m "Add atlas-flux-demo Kustomization"
+ 
+git push
+```
+
+## Watch Flux sync the Application 
+
+Use the `flux get` command to watch the deployment flow.
+
+```bash
+flux get kustomizations --watch  
+```
+
+This command allows you to fetch and observe the status of `Kustomize` resources managed by Flux in your Kubernetes cluster, with real-time updates as changes are made.
+
+To check whether the schema migrations have been successfully applied, you can follow these steps:
+
+1. Identify the name of the `MySQL` pod using the following command:
+
+```bash
+kubectl get pods -n default 
+```
+
+Run a command inside the `MySQL` pod to describe the columns of the `users` table. Using the following command:
+
+```bash
+kubectl exec -it -n default <pod name> -- mysql -u root -ppass -e "USE example; DESCRIBE users;"
+```
+
+## Conclusion
+
+In this guide, we demonstrated how to use Flux CD to deploy an application that uses the Atlas Operator to manage the lifecycle of the database schema. We also showed how to use Flux dependency management to ensure that the schema changes were successfully applied before deploying the application.
